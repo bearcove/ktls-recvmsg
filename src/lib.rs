@@ -1,7 +1,21 @@
-use cfg_if::cfg_if;
-use libc::{c_int, timespec, timeval};
+use libc::{c_void, iovec, CMSG_DATA, CMSG_FIRSTHDR, CMSG_NXTHDR};
 pub use libc::{cmsghdr, msghdr};
-use std::os::unix::io::RawFd;
+pub use nix::{
+    errno::Errno,
+    sys::socket::{MsgFlags, SockaddrIn},
+};
+use nix::{
+    sys::{
+        socket::{SockaddrLike, Timestamps, UnixCredentials},
+        time::{TimeSpec, TimeVal},
+    },
+    Result,
+};
+use std::{io::IoSliceMut, mem, os::unix::io::RawFd, ptr};
+
+// An opaque structure used to prevent cmsghdr from being a public type
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnknownCmsg(cmsghdr, Vec<u8>);
 
 /// A type-safe wrapper around a single control message, as used with
 /// [`recvmsg`](#fn.recvmsg).
@@ -193,276 +207,356 @@ pub enum ControlMessageOwned {
     Unknown(UnknownCmsg),
 }
 
-cfg_if! {
-    if #[cfg(any(target_os = "android", target_os = "linux"))] {
-        /// Unix credentials of the sending process.
-        ///
-        /// This struct is used with the `SO_PEERCRED` ancillary message
-        /// and the `SCM_CREDENTIALS` control message for UNIX sockets.
-        #[repr(transparent)]
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub struct UnixCredentials(libc::ucred);
-
-        impl UnixCredentials {
-            /// Creates a new instance with the credentials of the current process
-            pub fn new() -> Self {
-                // Safe because these FFI functions are inherently safe
-                unsafe {
-                    UnixCredentials(libc::ucred {
-                        pid: libc::getpid(),
-                        uid: libc::getuid(),
-                        gid: libc::getgid()
-                    })
+impl ControlMessageOwned {
+    /// Decodes a `ControlMessageOwned` from raw bytes.
+    ///
+    /// This is only safe to call if the data is correct for the message type
+    /// specified in the header. Normally, the kernel ensures that this is the
+    /// case. "Correct" in this case includes correct length, alignment and
+    /// actual content.
+    // Clippy complains about the pointer alignment of `p`, not understanding
+    // that it's being fed to a function that can handle that.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe fn decode_from(header: &cmsghdr) -> ControlMessageOwned {
+        let p = CMSG_DATA(header);
+        // The cast is not unnecessary on all platforms.
+        #[allow(clippy::unnecessary_cast)]
+        let len = header as *const _ as usize + header.cmsg_len as usize - p as usize;
+        match (header.cmsg_level, header.cmsg_type) {
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
+                let n = len / mem::size_of::<RawFd>();
+                let mut fds = Vec::with_capacity(n);
+                for i in 0..n {
+                    let fdp = (p as *const RawFd).add(i);
+                    fds.push(ptr::read_unaligned(fdp));
                 }
+                ControlMessageOwned::ScmRights(fds)
             }
-
-            /// Returns the process identifier
-            pub fn pid(&self) -> libc::pid_t {
-                self.0.pid
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            (libc::SOL_SOCKET, libc::SCM_CREDENTIALS) => {
+                let cred: libc::ucred = ptr::read_unaligned(p as *const _);
+                ControlMessageOwned::ScmCredentials(cred.into())
             }
-
-            /// Returns the user identifier
-            pub fn uid(&self) -> libc::uid_t {
-                self.0.uid
+            #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+            (libc::SOL_SOCKET, libc::SCM_CREDS) => {
+                let cred: libc::cmsgcred = ptr::read_unaligned(p as *const _);
+                ControlMessageOwned::ScmCreds(cred.into())
             }
-
-            /// Returns the group identifier
-            pub fn gid(&self) -> libc::gid_t {
-                self.0.gid
+            #[cfg(not(any(target_os = "aix", target_os = "haiku")))]
+            (libc::SOL_SOCKET, libc::SCM_TIMESTAMP) => {
+                let tv: libc::timeval = ptr::read_unaligned(p as *const _);
+                ControlMessageOwned::ScmTimestamp(TimeVal::from(tv))
+            }
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            (libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS) => {
+                let ts: libc::timespec = ptr::read_unaligned(p as *const _);
+                ControlMessageOwned::ScmTimestampns(TimeSpec::from(ts))
+            }
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            (libc::SOL_SOCKET, libc::SCM_TIMESTAMPING) => {
+                let tp = p as *const libc::timespec;
+                let ts: libc::timespec = ptr::read_unaligned(tp);
+                let system = TimeSpec::from(ts);
+                let ts: libc::timespec = ptr::read_unaligned(tp.add(1));
+                let hw_trans = TimeSpec::from(ts);
+                let ts: libc::timespec = ptr::read_unaligned(tp.add(2));
+                let hw_raw = TimeSpec::from(ts);
+                let timestamping = Timestamps {
+                    system,
+                    hw_trans,
+                    hw_raw,
+                };
+                ControlMessageOwned::ScmTimestampsns(timestamping)
+            }
+            #[cfg(any(
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "linux",
+                target_os = "macos"
+            ))]
+            #[cfg(feature = "net")]
+            (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
+                let info = ptr::read_unaligned(p as *const libc::in6_pktinfo);
+                ControlMessageOwned::Ipv6PacketInfo(info)
+            }
+            #[cfg(any(
+                target_os = "android",
+                target_os = "ios",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "netbsd",
+            ))]
+            #[cfg(feature = "net")]
+            (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
+                let info = ptr::read_unaligned(p as *const libc::in_pktinfo);
+                ControlMessageOwned::Ipv4PacketInfo(info)
+            }
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
+            #[cfg(feature = "net")]
+            (libc::IPPROTO_IP, libc::IP_RECVIF) => {
+                let dl = ptr::read_unaligned(p as *const libc::sockaddr_dl);
+                ControlMessageOwned::Ipv4RecvIf(dl)
+            }
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
+            #[cfg(feature = "net")]
+            (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => {
+                let dl = ptr::read_unaligned(p as *const libc::in_addr);
+                ControlMessageOwned::Ipv4RecvDstAddr(dl)
+            }
+            #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
+            #[cfg(feature = "net")]
+            (libc::IPPROTO_IP, libc::IP_ORIGDSTADDR) => {
+                let dl = ptr::read_unaligned(p as *const libc::sockaddr_in);
+                ControlMessageOwned::Ipv4OrigDstAddr(dl)
+            }
+            #[cfg(target_os = "linux")]
+            #[cfg(feature = "net")]
+            (libc::SOL_UDP, libc::UDP_GRO) => {
+                let gso_size: u16 = ptr::read_unaligned(p as *const _);
+                ControlMessageOwned::UdpGroSegments(gso_size)
+            }
+            #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+            (libc::SOL_SOCKET, libc::SO_RXQ_OVFL) => {
+                let drop_counter = ptr::read_unaligned(p as *const u32);
+                ControlMessageOwned::RxqOvfl(drop_counter)
+            }
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            #[cfg(feature = "net")]
+            (libc::IPPROTO_IP, libc::IP_RECVERR) => {
+                let (err, addr) = Self::recv_err_helper::<sockaddr_in>(p, len);
+                ControlMessageOwned::Ipv4RecvErr(err, addr)
+            }
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            #[cfg(feature = "net")]
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVERR) => {
+                let (err, addr) = Self::recv_err_helper::<sockaddr_in6>(p, len);
+                ControlMessageOwned::Ipv6RecvErr(err, addr)
+            }
+            #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "linux"))]
+            #[cfg(feature = "net")]
+            (libc::IPPROTO_IPV6, libc::IPV6_ORIGDSTADDR) => {
+                let dl = ptr::read_unaligned(p as *const libc::sockaddr_in6);
+                ControlMessageOwned::Ipv6OrigDstAddr(dl)
+            }
+            #[cfg(all(target_os = "linux"))]
+            (libc::SOL_TLS, libc::TLS_GET_RECORD_TYPE) => {
+                let content_type = ptr::read_unaligned(p as *const u8);
+                ControlMessageOwned::TlsGetRecordType(content_type)
+            }
+            (_, _) => {
+                let sl = std::slice::from_raw_parts(p, len);
+                let ucmsg = UnknownCmsg(*header, Vec::<u8>::from(sl));
+                ControlMessageOwned::Unknown(ucmsg)
             }
         }
+    }
 
-        impl Default for UnixCredentials {
-            fn default() -> Self {
-                Self::new()
-            }
-        }
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[cfg(feature = "net")]
+    #[allow(clippy::cast_ptr_alignment)] // False positive
+    unsafe fn recv_err_helper<T>(
+        p: *mut libc::c_uchar,
+        len: usize,
+    ) -> (libc::sock_extended_err, Option<T>) {
+        let ee = p as *const libc::sock_extended_err;
+        let err = ptr::read_unaligned(ee);
 
-        impl From<libc::ucred> for UnixCredentials {
-            fn from(cred: libc::ucred) -> Self {
-                UnixCredentials(cred)
-            }
-        }
+        // For errors originating on the network, SO_EE_OFFENDER(ee) points inside the p[..len]
+        // CMSG_DATA buffer.  For local errors, there is no address included in the control
+        // message, and SO_EE_OFFENDER(ee) points beyond the end of the buffer.  So, we need to
+        // validate that the address object is in-bounds before we attempt to copy it.
+        let addrp = libc::SO_EE_OFFENDER(ee) as *const T;
 
-        impl From<UnixCredentials> for libc::ucred {
-            fn from(uc: UnixCredentials) -> Self {
-                uc.0
-            }
-        }
-    } else if #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))] {
-        /// Unix credentials of the sending process.
-        ///
-        /// This struct is used with the `SCM_CREDS` ancillary message for UNIX sockets.
-        #[repr(transparent)]
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub struct UnixCredentials(libc::cmsgcred);
-
-        impl UnixCredentials {
-            /// Returns the process identifier
-            pub fn pid(&self) -> libc::pid_t {
-                self.0.cmcred_pid
-            }
-
-            /// Returns the real user identifier
-            pub fn uid(&self) -> libc::uid_t {
-                self.0.cmcred_uid
-            }
-
-            /// Returns the effective user identifier
-            pub fn euid(&self) -> libc::uid_t {
-                self.0.cmcred_euid
-            }
-
-            /// Returns the real group identifier
-            pub fn gid(&self) -> libc::gid_t {
-                self.0.cmcred_gid
-            }
-
-            /// Returns a list group identifiers (the first one being the effective GID)
-            pub fn groups(&self) -> &[libc::gid_t] {
-                unsafe {
-                    std::slice::from_raw_parts(
-                        self.0.cmcred_groups.as_ptr() as *const libc::gid_t,
-                        self.0.cmcred_ngroups as _
-                    )
-                }
-            }
-        }
-
-        impl From<libc::cmsgcred> for UnixCredentials {
-            fn from(cred: libc::cmsgcred) -> Self {
-                UnixCredentials(cred)
-            }
+        if addrp.offset(1) as usize - (p as usize) > len {
+            (err, None)
+        } else {
+            (err, Some(ptr::read_unaligned(addrp)))
         }
     }
 }
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TimeVal(timeval);
-
-/// For representing packet timestamps via `SO_TIMESTAMPING` interface
-#[cfg(target_os = "linux")]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Timestamps {
-    /// software based timestamp, usually one containing data
-    pub system: TimeSpec,
-    /// legacy timestamp, usually empty
-    pub hw_trans: TimeSpec,
-    /// hardware based timestamp
-    pub hw_raw: TimeSpec,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TimeSpec(timespec);
-
-// An opaque structure used to prevent cmsghdr from being a public type
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnknownCmsg(cmsghdr, Vec<u8>);
-
-/// The `libc_bitflags!` macro helps with a common use case of defining a public bitflags type
-/// with values from the libc crate. It is used the same way as the `bitflags!` macro, except
-/// that only the name of the flag value has to be given.
+/// Receive message in scatter-gather vectors from a socket, and
+/// optionally receive ancillary data into the provided buffer.
+/// If no ancillary data is desired, use () as the type parameter.
 ///
-/// The `libc` crate must be in scope with the name `libc`.
+/// # Arguments
 ///
-/// # Example
-/// ```ignore
-/// libc_bitflags!{
-///     pub struct ProtFlags: libc::c_int {
-///         PROT_NONE;
-///         PROT_READ;
-///         /// PROT_WRITE enables write protect
-///         PROT_WRITE;
-///         PROT_EXEC;
-///         #[cfg(any(target_os = "linux", target_os = "android"))]
-///         PROT_GROWSDOWN;
-///         #[cfg(any(target_os = "linux", target_os = "android"))]
-///         PROT_GROWSUP;
-///     }
-/// }
-/// ```
+/// * `fd`:             Socket file descriptor
+/// * `iov`:            Scatter-gather list of buffers to receive the message
+/// * `cmsg_buffer`:    Space to receive ancillary data.  Should be created by
+///                     [`cmsg_space!`](../../macro.cmsg_space.html)
+/// * `flags`:          Optional flags passed directly to the operating system.
 ///
-/// Example with casting, due to a mistake in libc. In this example, the
-/// various flags have different types, so we cast the broken ones to the right
-/// type.
-///
-/// ```ignore
-/// libc_bitflags!{
-///     pub struct SaFlags: libc::c_ulong {
-///         SA_NOCLDSTOP as libc::c_ulong;
-///         SA_NOCLDWAIT;
-///         SA_NODEFER as libc::c_ulong;
-///         SA_ONSTACK;
-///         SA_RESETHAND as libc::c_ulong;
-///         SA_RESTART as libc::c_ulong;
-///         SA_SIGINFO;
-///     }
-/// }
-/// ```
-macro_rules! libc_bitflags {
-    (
-        $(#[$outer:meta])*
-        pub struct $BitFlags:ident: $T:ty {
-            $(
-                $(#[$inner:ident $($args:tt)*])*
-                $Flag:ident $(as $cast:ty)*;
-            )+
-        }
-    ) => {
-        ::bitflags::bitflags! {
-            $(#[$outer])*
-            pub struct $BitFlags: $T {
-                $(
-                    $(#[$inner $($args)*])*
-                    const $Flag = libc::$Flag $(as $cast)*;
-                )+
-            }
-        }
+/// # References
+/// [recvmsg(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/recvmsg.html)
+pub fn recvmsg<'a, 'outer, 'inner, S>(
+    fd: RawFd,
+    iov: &'outer mut [IoSliceMut<'inner>],
+    mut cmsg_buffer: Option<&'a mut Vec<u8>>,
+    flags: MsgFlags,
+) -> Result<RecvMsg<'a, 'outer, S>>
+where
+    S: SockaddrLike + 'a,
+    'inner: 'outer,
+{
+    let mut address = mem::MaybeUninit::uninit();
+
+    let (msg_control, msg_controllen) = cmsg_buffer
+        .as_mut()
+        .map(|v| (v.as_mut_ptr(), v.capacity()))
+        .unwrap_or((ptr::null_mut(), 0));
+    let mut mhdr = unsafe {
+        pack_mhdr_to_receive(
+            iov.as_mut().as_mut_ptr(),
+            iov.len(),
+            msg_control,
+            msg_controllen,
+            address.as_mut_ptr(),
+        )
     };
+
+    let ret = unsafe { libc::recvmsg(fd, &mut mhdr, flags.bits()) };
+
+    let r = Errno::result(ret)?;
+
+    Ok(unsafe { read_mhdr(mhdr, r, msg_controllen, address.assume_init()) })
 }
 
-libc_bitflags! {
-    /// Flags for send/recv and their relatives
-    pub struct MsgFlags: c_int {
-        /// Sends or requests out-of-band data on sockets that support this notion
-        /// (e.g., of type [`Stream`](enum.SockType.html)); the underlying protocol must also
-        /// support out-of-band data.
-        MSG_OOB;
-        /// Peeks at an incoming message. The data is treated as unread and the next
-        /// [`recv()`](fn.recv.html)
-        /// or similar function shall still return this data.
-        MSG_PEEK;
-        /// Receive operation blocks until the full amount of data can be
-        /// returned. The function may return smaller amount of data if a signal
-        /// is caught, an error or disconnect occurs.
-        MSG_WAITALL;
-        /// Enables nonblocking operation; if the operation would block,
-        /// `EAGAIN` or `EWOULDBLOCK` is returned.  This provides similar
-        /// behavior to setting the `O_NONBLOCK` flag
-        /// (via the [`fcntl`](../../fcntl/fn.fcntl.html)
-        /// `F_SETFL` operation), but differs in that `MSG_DONTWAIT` is a per-
-        /// call option, whereas `O_NONBLOCK` is a setting on the open file
-        /// description (see [open(2)](https://man7.org/linux/man-pages/man2/open.2.html)),
-        /// which will affect all threads in
-        /// the calling process and as well as other processes that hold
-        /// file descriptors referring to the same open file description.
-        MSG_DONTWAIT;
-        /// Receive flags: Control Data was discarded (buffer too small)
-        MSG_CTRUNC;
-        /// For raw ([`Packet`](addr/enum.AddressFamily.html)), Internet datagram
-        /// (since Linux 2.4.27/2.6.8),
-        /// netlink (since Linux 2.6.22) and UNIX datagram (since Linux 3.4)
-        /// sockets: return the real length of the packet or datagram, even
-        /// when it was longer than the passed buffer. Not implemented for UNIX
-        /// domain ([unix(7)](https://linux.die.net/man/7/unix)) sockets.
-        ///
-        /// For use with Internet stream sockets, see [tcp(7)](https://linux.die.net/man/7/tcp).
-        MSG_TRUNC;
-        /// Terminates a record (when this notion is supported, as for
-        /// sockets of type [`SeqPacket`](enum.SockType.html)).
-        MSG_EOR;
-        /// This flag specifies that queued errors should be received from
-        /// the socket error queue. (For more details, see
-        /// [recvfrom(2)](https://linux.die.net/man/2/recvfrom))
-        #[cfg(any(target_os = "android", target_os = "linux"))]
-        #[cfg_attr(docsrs, doc(cfg(all())))]
-        MSG_ERRQUEUE;
-        /// Set the `close-on-exec` flag for the file descriptor received via a UNIX domain
-        /// file descriptor using the `SCM_RIGHTS` operation (described in
-        /// [unix(7)](https://linux.die.net/man/7/unix)).
-        /// This flag is useful for the same reasons as the `O_CLOEXEC` flag of
-        /// [open(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/open.html).
-        ///
-        /// Only used in [`recvmsg`](fn.recvmsg.html) function.
-        #[cfg(any(target_os = "android",
-                  target_os = "dragonfly",
-                  target_os = "freebsd",
-                  target_os = "linux",
-                  target_os = "netbsd",
-                  target_os = "openbsd"))]
-        #[cfg_attr(docsrs, doc(cfg(all())))]
-        MSG_CMSG_CLOEXEC;
-        /// Requests not to send `SIGPIPE` errors when the other end breaks the connection.
-        /// (For more details, see [send(2)](https://linux.die.net/man/2/send)).
-        #[cfg(any(target_os = "android",
-                  target_os = "dragonfly",
-                  target_os = "freebsd",
-                  target_os = "fuchsia",
-                  target_os = "haiku",
-                  target_os = "illumos",
-                  target_os = "linux",
-                  target_os = "netbsd",
-                  target_os = "openbsd",
-                  target_os = "solaris"))]
-        #[cfg_attr(docsrs, doc(cfg(all())))]
-        MSG_NOSIGNAL;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Contains outcome of sending or receiving a message
+///
+/// Use [`cmsgs`][RecvMsg::cmsgs] to access all the control messages present, and
+/// [`iovs`][RecvMsg::iovs`] to access underlying io slices.
+pub struct RecvMsg<'a, 's, S> {
+    pub bytes: usize,
+    cmsghdr: Option<&'a cmsghdr>,
+    pub address: Option<S>,
+    pub flags: MsgFlags,
+    iobufs: std::marker::PhantomData<&'s ()>,
+    mhdr: msghdr,
+}
+
+impl<'a, S> RecvMsg<'a, '_, S> {
+    /// Iterate over the valid control messages pointed to by this
+    /// msghdr.
+    pub fn cmsgs(&self) -> CmsgIterator {
+        CmsgIterator {
+            cmsghdr: self.cmsghdr,
+            mhdr: &self.mhdr,
+        }
     }
 }
 
-/// An IPv4 socket address
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SockaddrIn(libc::sockaddr_in);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CmsgIterator<'a> {
+    /// Control message buffer to decode from. Must adhere to cmsg alignment.
+    cmsghdr: Option<&'a cmsghdr>,
+    mhdr: &'a msghdr,
+}
+
+impl<'a> Iterator for CmsgIterator<'a> {
+    type Item = ControlMessageOwned;
+
+    fn next(&mut self) -> Option<ControlMessageOwned> {
+        match self.cmsghdr {
+            None => None, // No more messages
+            Some(hdr) => {
+                // Get the data.
+                // Safe if cmsghdr points to valid data returned by recvmsg(2)
+                let cm = unsafe { Some(ControlMessageOwned::decode_from(hdr)) };
+                // Advance the internal pointer.  Safe if mhdr and cmsghdr point
+                // to valid data returned by recvmsg(2)
+                self.cmsghdr = unsafe {
+                    let p = CMSG_NXTHDR(self.mhdr as *const _, hdr as *const _);
+                    p.as_ref()
+                };
+                cm
+            }
+        }
+    }
+}
+
+/// Pack pointers to various structures into into msghdr
+///
+/// # Safety
+/// `iov_buffer` and `iov_buffer_len` must point to a slice
+/// of `IoSliceMut` and number of available elements or be a null pointer and 0
+///
+/// `cmsg_buffer` and `cmsg_capacity` must point to a byte buffer used
+/// to store control headers later or be a null pointer and 0 if control
+/// headers are not used
+///
+/// Buffers must remain valid for the whole lifetime of msghdr
+unsafe fn pack_mhdr_to_receive<S>(
+    iov_buffer: *mut IoSliceMut,
+    iov_buffer_len: usize,
+    cmsg_buffer: *mut u8,
+    cmsg_capacity: usize,
+    address: *mut S,
+) -> msghdr
+where
+    S: SockaddrLike,
+{
+    // Musl's msghdr has private fields, so this is the only way to
+    // initialize it.
+    let mut mhdr = mem::MaybeUninit::<msghdr>::zeroed();
+    let p = mhdr.as_mut_ptr();
+    (*p).msg_name = address as *mut c_void;
+    (*p).msg_namelen = S::size();
+    (*p).msg_iov = iov_buffer as *mut iovec;
+    (*p).msg_iovlen = iov_buffer_len as _;
+    (*p).msg_control = cmsg_buffer as *mut c_void;
+    (*p).msg_controllen = cmsg_capacity as _;
+    (*p).msg_flags = 0;
+    mhdr.assume_init()
+}
+
+unsafe fn read_mhdr<'a, 'i, S>(
+    mhdr: msghdr,
+    r: isize,
+    msg_controllen: usize,
+    mut address: S,
+) -> RecvMsg<'a, 'i, S>
+where
+    S: SockaddrLike,
+{
+    // The cast is not unnecessary on all platforms.
+    #[allow(clippy::unnecessary_cast)]
+    let cmsghdr = {
+        if mhdr.msg_controllen > 0 {
+            debug_assert!(!mhdr.msg_control.is_null());
+            debug_assert!(msg_controllen >= mhdr.msg_controllen as usize);
+            CMSG_FIRSTHDR(&mhdr as *const msghdr)
+        } else {
+            ptr::null()
+        }
+        .as_ref()
+    };
+
+    // Ignore errors if this socket address has statically-known length
+    //
+    // This is to ensure that unix socket addresses have their length set appropriately.
+    let _ = address.set_length(mhdr.msg_namelen as usize);
+
+    RecvMsg {
+        bytes: r as usize,
+        cmsghdr,
+        address: Some(address),
+        flags: MsgFlags::from_bits_truncate(mhdr.msg_flags),
+        mhdr,
+        iobufs: std::marker::PhantomData,
+    }
+}
