@@ -1,5 +1,4 @@
-use libc::{c_void, iovec, CMSG_DATA, CMSG_FIRSTHDR, CMSG_NXTHDR};
-pub use libc::{cmsghdr, msghdr};
+use libc::{c_void, cmsghdr, iovec, msghdr, CMSG_DATA, CMSG_FIRSTHDR, CMSG_NXTHDR};
 pub use nix::{
     errno::Errno,
     sys::socket::{MsgFlags, SockaddrIn},
@@ -351,7 +350,7 @@ impl ControlMessageOwned {
                 let dl = ptr::read_unaligned(p as *const libc::sockaddr_in6);
                 ControlMessageOwned::Ipv6OrigDstAddr(dl)
             }
-            #[cfg(all(target_os = "linux"))]
+            #[cfg(target_os = "linux")]
             (libc::SOL_TLS, libc::TLS_GET_RECORD_TYPE) => {
                 let content_type = ptr::read_unaligned(p as *const u8);
                 ControlMessageOwned::TlsGetRecordType(content_type)
