@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/hapsoc/ktls-recvmsg/compare/v0.1.1...v0.1.2) - 2023-10-02
+
+### Other
+- Use rust stable?
+- Put the test workflow in the right directory 🤦
+- Run tests in CI
+
 ## [0.1.1](https://github.com/hapsoc/ktls-recvmsg/compare/v0.1.0...v0.1.1) - 2023-09-28
 
 ### Other
