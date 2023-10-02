@@ -1,6 +1,6 @@
 [package]
 name = "ktls-recvmsg"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Bits of the nix crate, extracted to be able to call recvmsg for ktls purposes"
 license = "MIT"
