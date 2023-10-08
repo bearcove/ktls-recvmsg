@@ -10,7 +10,12 @@ use nix::{
     },
     Result,
 };
-use std::{io::IoSliceMut, mem, os::unix::io::RawFd, ptr};
+use std::{
+    io::{IoSlice, IoSliceMut},
+    mem,
+    os::unix::io::RawFd,
+    ptr,
+};
 
 // An opaque structure used to prevent cmsghdr from being a public type
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -485,6 +490,48 @@ impl<'a> Iterator for CmsgIterator<'a> {
                 cm
             }
         }
+    }
+}
+
+impl<'a, S> RecvMsg<'_, 'a, S> {
+    /// Iterate over the filled io slices pointed by this msghdr
+    pub fn iovs(&self) -> IoSliceIterator<'a> {
+        IoSliceIterator {
+            index: 0,
+            remaining: self.bytes,
+            slices: unsafe {
+                // safe for as long as mgdr is properly initialized and references are valid.
+                // for multi messages API we initialize it with an empty
+                // slice and replace with a concrete buffer
+                // for single message API we hold a lifetime reference to ioslices
+                std::slice::from_raw_parts(self.mhdr.msg_iov as *const _, self.mhdr.msg_iovlen as _)
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct IoSliceIterator<'a> {
+    index: usize,
+    remaining: usize,
+    slices: &'a [IoSlice<'a>],
+}
+
+impl<'a> Iterator for IoSliceIterator<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.slices.len() {
+            return None;
+        }
+        let slice = &self.slices[self.index][..self.remaining.min(self.slices[self.index].len())];
+        self.remaining -= slice.len();
+        self.index += 1;
+        if slice.is_empty() {
+            return None;
+        }
+
+        Some(slice)
     }
 }
 
