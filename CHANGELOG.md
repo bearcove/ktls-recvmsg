@@ -6,25 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.3](https://github.com/hapsoc/ktls-recvmsg/compare/v0.1.2...v0.1.3) - 2023-10-08
+## [0.1.3](https://github.com/bearcove/ktls-recvmsg/compare/v0.1.2...v0.1.3) - 2023-10-08
 
 ### Added
 - Add RecvMsg::iovs
 
-## [0.1.2](https://github.com/hapsoc/ktls-recvmsg/compare/v0.1.1...v0.1.2) - 2023-10-02
+## [0.1.2](https://github.com/bearcove/ktls-recvmsg/compare/v0.1.1...v0.1.2) - 2023-10-02
 
 ### Other
 - Use rust stable?
 - Put the test workflow in the right directory 🤦
 - Run tests in CI
 
-## [0.1.1](https://github.com/hapsoc/ktls-recvmsg/compare/v0.1.0...v0.1.1) - 2023-09-28
+## [0.1.1](https://github.com/bearcove/ktls-recvmsg/compare/v0.1.0...v0.1.1) - 2023-09-28
 
 ### Other
 - Re-export fewer things, simplify cfg gates
 - release
 
-## [0.1.0](https://github.com/hapsoc/ktls-recvmsg/releases/tag/v0.1.0) - 2023-09-28
+## [0.1.0](https://github.com/bearcove/ktls-recvmsg/releases/tag/v0.1.0) - 2023-09-28
 
 ### Other
 - Add description & license
