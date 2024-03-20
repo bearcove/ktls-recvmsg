@@ -9,5 +9,5 @@ repository = "https://github.com/bearcove/ktls-recvmsg"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libc = { version = "0.2.148", features = ["const-extern-fn", "extra_traits"] }
-nix = { version = "0.27.1", features = ["socket", "uio", "net"], default-features = false }
+libc = { version = "0.2.153", features = ["const-extern-fn", "extra_traits"] }
+nix = { version = "0.28.0", features = ["socket", "uio", "net"], default-features = false }
